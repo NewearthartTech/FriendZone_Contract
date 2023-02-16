@@ -5,17 +5,6 @@ use core::fmt::Debug;
 /// Your smart contract state.
 #[derive(Serialize, SchemaType, Clone)]
 pub struct State {
-    // Your state
-}
-
-/// Your smart contract errors.
-#[derive(Debug, PartialEq, Eq, Reject, Serial, SchemaType)]
-enum Error {
-    /// Failed parsing the parameter.
-    #[from(ParseError)]
-    ParseParamsError,
-    /// Your error
-    YourError,
 }
 
 /// Init function that creates a new smart contract.
@@ -24,42 +13,54 @@ fn init<S: HasStateApi>(
     _ctx: &impl HasInitContext,
     _state_builder: &mut StateBuilder<S>,
 ) -> InitResult<State> {
-    // Your code
-
-    Ok(State {})
+    
+    Ok(State {
+    })
 }
 
-/// Receive function. The input parameter is the boolean variable `throw_error`.
-///  If `throw_error == true`, the receive function will throw a custom error.
-///  If `throw_error == false`, the receive function executes successfully.
+/// Your smart contract errors.
+#[derive(Debug, PartialEq, Eq, Reject, Serial, SchemaType)]
+enum Error {
+    /// Failed parsing the parameter.
+    #[from(ParseError)]
+    ParseParamsError,
+    ContractAddressNotAllowed,
+}
+
 #[receive(
     contract = "frndz",
-    name = "receive",
-    parameter = "bool",
+    name = "load",
     error = "Error",
-    mutable
+    mutable,
+    payable
 )]
-fn receive<S: HasStateApi>(
-    ctx: &impl HasReceiveContext,
+fn load<S: HasStateApi>(
+    _ctx: &impl HasReceiveContext,
     _host: &mut impl HasHost<State, StateApiType = S>,
+    _amount: Amount,
 ) -> Result<(), Error> {
-    // Your code
-
-    let throw_error = ctx.parameter_cursor().get()?; // Returns Error::ParseError on failure
-    if throw_error {
-        Err(Error::YourError)
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
-/// View function that returns the content of the state.
-#[receive(contract = "frndz", name = "view", return_value = "State")]
-fn view<'b, S: HasStateApi>(
-    _ctx: &impl HasReceiveContext,
-    host: &'b impl HasHost<State, StateApiType = S>,
-) -> ReceiveResult<&'b State> {
-    Ok(host.state())
+#[derive(Serialize, SchemaType)]
+struct ClaimParameter {
+    amount_to_claim: Amount,
+}
+
+/// View function that returns the content of the RewardView.
+#[receive(contract = "frndz", name = "claimreward", mutable, error = "Error", parameter = "ClaimParameter")]
+fn claimreward<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State, StateApiType = S>,
+) -> Result<(), Error> {
+    let sender = match ctx.sender() {
+        Address::Account(acc) => acc,
+        Address::Contract(_) => return Err(Error::ContractAddressNotAllowed),
+    };
+    let claim_parameter: ClaimParameter = ctx.parameter_cursor().get()?;
+
+    let _res = host.invoke_transfer(&sender, claim_parameter.amount_to_claim);
+    Ok(())
 }
 
 #[concordium_cfg_test]
@@ -67,23 +68,11 @@ mod tests {
     use super::*;
     use test_infrastructure::*;
 
-    type ContractResult<A> = Result<A, Error>;
+    const ACC: AccountAddress = AccountAddress([0u8; 32]);
 
-    #[concordium_test]
-    /// Test that initializing the contract succeeds with some state.
-    fn test_init() {
-        let ctx = TestInitContext::empty();
-
-        let mut state_builder = TestStateBuilder::new();
-
-        let state_result = init(&ctx, &mut state_builder);
-        state_result.expect_report("Contract initialization results in error");
-    }
-
-    #[concordium_test]
-    /// Test that invoking the `receive` endpoint with the `false` parameter
-    /// succeeds in updating the contract.
-    fn test_throw_no_error() {
+    #[test]
+    fn test_load() {
+        // Init
         let ctx = TestInitContext::empty();
 
         let mut state_builder = TestStateBuilder::new();
@@ -91,25 +80,24 @@ mod tests {
         // Initializing state
         let initial_state = init(&ctx, &mut state_builder).expect("Initialization should pass");
 
+        // arrange
         let mut ctx = TestReceiveContext::empty();
-
-        let throw_error = false;
-        let parameter_bytes = to_bytes(&throw_error);
-        ctx.set_parameter(&parameter_bytes);
+        ctx.set_sender(Address::Account(ACC));
+        let amount = Amount::from_micro_ccd(1000);
 
         let mut host = TestHost::new(initial_state, state_builder);
-
-        // Call the contract function.
-        let result: ContractResult<()> = receive(&ctx, &mut host);
-
-        // Check the result.
-        claim!(result.is_ok(), "Results in rejection");
+        host.set_self_balance(amount);
+        // act
+        let result = load(&ctx, &mut host, amount);
+        let balance = host.self_balance();
+        // assert
+        assert!(result.is_ok(), "Inserting CCD results in error");
+        assert_eq!(balance, Amount::from_micro_ccd(1000));
     }
 
-    #[concordium_test]
-    /// Test that invoking the `receive` endpoint with the `true` parameter
-    /// results in the `YourError` being thrown.
-    fn test_throw_error() {
+    #[test]
+    fn test_claimreward() {
+        // Init
         let ctx = TestInitContext::empty();
 
         let mut state_builder = TestStateBuilder::new();
@@ -117,18 +105,24 @@ mod tests {
         // Initializing state
         let initial_state = init(&ctx, &mut state_builder).expect("Initialization should pass");
 
+        // arrange
         let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(Address::Account(ACC));
 
-        let throw_error = true;
-        let parameter_bytes = to_bytes(&throw_error);
-        ctx.set_parameter(&parameter_bytes);
-
+        let amount_to_claim = Amount::from_micro_ccd(700);
+        let parameter = to_bytes(&amount_to_claim);
+        ctx.set_parameter(&parameter);
+        
         let mut host = TestHost::new(initial_state, state_builder);
-
-        // Call the contract function.
-        let error: ContractResult<()> = receive(&ctx, &mut host);
-
-        // Check the result.
-        claim_eq!(error, Err(Error::YourError), "Function should throw an error.");
+        // act
+        let amount = Amount::from_micro_ccd(1000);
+        host.set_self_balance(amount);
+        load(&ctx, &mut host, amount);
+        
+        let result = claimreward(&ctx, &mut host);
+        let balance = host.self_balance();
+        // assert
+        assert!(result.is_ok(), "Inserting CCD results in error");
+        assert_eq!(balance, Amount::from_micro_ccd(300));
     }
 }
